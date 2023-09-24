@@ -18,3 +18,4 @@ uuid = { version = "1.3", features = ["v4"] }
 reqwest = "0.11.18"
 dotenvy = "0.15"
 constant_time_eq = "0.3"
+openidconnect = "3.0.0"

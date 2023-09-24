@@ -11,19 +11,39 @@ use axum::{
 };
 use dotenvy::var;
 use oauth2::{
-    basic::BasicClient, reqwest::http_client, AuthUrl, AuthorizationCode, ClientId, ClientSecret,
-    CsrfToken, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RevocationUrl, Scope,
-    TokenResponse, TokenUrl,
+    basic::BasicClient,
+    reqwest::{async_http_client, http_client},
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, RevocationUrl, Scope, TokenResponse, TokenUrl,
 };
 
 use chrono::Utc;
+use openidconnect::{
+    core::{
+        CoreClaimName, CoreClient, CoreGenderClaim, CoreIdTokenClaims, CoreIdTokenVerifier,
+        CoreProviderMetadata, CoreResponseType,
+    },
+    AdditionalClaims, AuthenticationFlow, IssuerUrl, LanguageTag, Nonce, UserInfoClaims,
+};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::{collections::HashMap, env};
 use uuid::Uuid;
 
 use super::{AppError, UserData};
 
-fn get_client(hostname: String) -> Result<BasicClient, AppError> {
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Claims {
+    username: String,
+    // policies: Vec<String>,
+    // email: EndUserEmail, This is in standard
+    // phone_number: EndUserPhoneNumber, This is also in standard
+    groups: Vec<String>,
+}
+impl AdditionalClaims for Claims {}
+
+fn get_client_(hostname: String) -> Result<BasicClient, AppError> {
     let google_client_id = ClientId::new(var("GOOGLE_CLIENT_ID")?);
     let google_client_secret = ClientSecret::new(var("GOOGLE_CLIENT_SECRET")?);
     let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
@@ -54,7 +74,95 @@ fn get_client(hostname: String) -> Result<BasicClient, AppError> {
     Ok(client)
 }
 
+async fn get_client() -> Result<CoreClient, AppError> {
+    let client_id = ClientId::new(var("CLIENT_ID")?);
+    let gitlab_client_secret = ClientSecret::new(var("CLIENT_SECRET")?);
+    let issuer_url = IssuerUrl::new(
+        "http://192.168.178.97:8200/v1/identity/oidc/provider/my-provider".to_string(),
+    )
+    .map_err(|_| "OAuth: Invalid issuer URL")?;
+
+    // Fetc OpenID Connect discovery document.
+    let provider_metadata = CoreProviderMetadata::discover_async(issuer_url, async_http_client)
+        .await
+        .map_err(|_| "OAuth: Failed to discover OpenID Provider")?
+        .set_scopes_supported(Some(vec![
+            Scope::new("openid".to_string()),
+            Scope::new("groups".to_string()),
+            Scope::new("user".to_string()),
+        ]))
+        .set_claims_supported(Some(vec![
+            // Providers may also define an enum instead of using CoreClaimName.
+            CoreClaimName::new("sub".to_string()),
+            CoreClaimName::new("email".to_string()),
+            CoreClaimName::new("username".to_string()),
+            CoreClaimName::new("phone_number".to_string()),
+            CoreClaimName::new("groups".to_string()),
+        ]));
+
+    // Set up the config for OAuth2 process.
+    let client = CoreClient::from_provider_metadata(
+        provider_metadata,
+        client_id,
+        Some(gitlab_client_secret),
+    )
+    // This example will be running its own server at localhost:8080.
+    // See below for the server implementation.
+    .set_redirect_uri(
+        RedirectUrl::new("http://192.168.178.97:3011/oauth_return".to_string())
+            .map_err(|_| "OAuth: Invalid redirect URL")?,
+    );
+
+    Ok(client)
+}
+
 pub async fn login(
+    Extension(user_data): Extension<Option<UserData>>,
+    Query(mut params): Query<HashMap<String, String>>,
+    State(db_pool): State<SqlitePool>,
+) -> Result<Redirect, AppError> {
+    if user_data.is_some() {
+        // check if already authenticated
+        return Ok(Redirect::to("/"));
+    }
+
+    let return_url = params
+        .remove("return_url")
+        .unwrap_or_else(|| "/".to_string());
+    // TODO: check if return_url is valid
+
+    let client = get_client().await?;
+
+    let (authorize_url, csrf_state, nonce) = client
+        .authorize_url(
+            AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
+            CsrfToken::new_random,
+            Nonce::new_random,
+        )
+        // This example is requesting access to the the user's profile including email.
+        .add_scope(Scope::new("groups".to_string()))
+        .add_scope(Scope::new("user".to_string()))
+        .add_claims_locale(LanguageTag::new("email".to_string()))
+        .add_claims_locale(LanguageTag::new("username".to_string()))
+        .add_claims_locale(LanguageTag::new("phone_number".to_string()))
+        .add_claims_locale(LanguageTag::new("groups".to_string()))
+        .url();
+
+    println!("insert");
+    sqlx::query(
+        "INSERT INTO oauth2_state_storage (csrf_state, nonce, return_url) VALUES (?, ?, ?);",
+    )
+    .bind(csrf_state.secret())
+    .bind(nonce.secret())
+    .bind(return_url)
+    .execute(&db_pool)
+    .await?;
+    println!("inserted");
+
+    Ok(Redirect::to(authorize_url.as_str()))
+}
+
+pub async fn login_(
     Extension(user_data): Extension<Option<UserData>>,
     Query(mut params): Query<HashMap<String, String>>,
     State(db_pool): State<SqlitePool>,
@@ -70,7 +178,7 @@ pub async fn login(
         .unwrap_or_else(|| "/".to_string());
     // TODO: check if return_url is valid
 
-    let client = get_client(hostname)?;
+    let client = get_client_(hostname)?;
 
     let (pkce_code_challenge, pkce_code_verifier) = PkceCodeChallenge::new_random_sha256();
 
@@ -95,6 +203,112 @@ pub async fn login(
 }
 
 pub async fn oauth_return(
+    Query(mut params): Query<HashMap<String, String>>,
+    State(db_pool): State<SqlitePool>,
+) -> Result<impl IntoResponse, AppError> {
+    let state = CsrfToken::new(params.remove("state").ok_or("OAuth: without state")?);
+    let code = AuthorizationCode::new(params.remove("code").ok_or("OAuth: without code")?);
+
+    println!("delete");
+    let query: (String, String) = sqlx::query_as(
+        r#"DELETE FROM oauth2_state_storage WHERE csrf_state = ? RETURNING nonce,return_url"#,
+    )
+    .bind(state.secret())
+    .fetch_one(&db_pool)
+    .await?;
+    println!("deleted");
+
+    let nonce = query.0;
+    let return_url = query.1;
+
+    // Alternative:
+    // let query: (String, String) = sqlx::query_as(
+    //     r#"SELECT pkce_code_verifier,return_url FROM oauth2_state_storage WHERE csrf_state = ?"#,
+    // )
+    // .bind(state.secret())
+    // .fetch_one(&db_pool)
+    // .await?;
+    // let _ = sqlx::query("DELETE FROM oauth2_state_storage WHERE csrf_state = ?")
+    //     .bind(state.secret())
+    //     .execute(&db_pool)
+    //     .await;
+
+    let client = get_client().await?;
+    // Exchange the code with a token.
+    let token_response = client
+        .exchange_code(code)
+        .request_async(async_http_client)
+        .await
+        .map_err(|_| "OAuth: Failed to contact token endpoint")?;
+
+    // let id_token_verifier: CoreIdTokenVerifier = client.id_token_verifier();
+    // let nonce = Nonce::new(nonce);
+    // let id_token_claims: &CoreIdTokenClaims = token_response
+    //     .extra_fields()
+    //     .id_token()
+    //     .ok_or("OAuth: Server did not return an ID token")?
+    //     .claims(&id_token_verifier, &nonce)
+    //     .map_err(|_| "OAuth: Failed to verify ID token")?;
+
+    let access_token = token_response.access_token().to_owned();
+
+    let userinfo_claims: UserInfoClaims<Claims, CoreGenderClaim> = client
+        .user_info(access_token, None)
+        .map_err(|_| "OAuth: No user info endpoint")?
+        .request(http_client)
+        .map_err(|_| "OAuth: Failed requesting user info")?;
+
+    let email = userinfo_claims
+        .email()
+        .to_owned()
+        .map(|s| s.to_string())
+        .ok_or("Auth: No email")?;
+
+    // Check if user exists in database
+    // If not, create a new user
+    let query: Result<(i64,), _> = sqlx::query_as(r#"SELECT id FROM users WHERE email=?"#)
+        .bind(email.as_str())
+        .fetch_one(&db_pool)
+        .await;
+    let user_id = if let Ok(query) = query {
+        query.0
+    } else {
+        let query: (i64,) = sqlx::query_as("INSERT INTO users (email) VALUES (?) RETURNING id")
+            .bind(email.as_str())
+            .fetch_one(&db_pool)
+            .await?;
+        query.0
+    };
+
+    // Create a session for the user
+    let session_token_p1 = Uuid::new_v4().to_string();
+    let session_token_p2 = Uuid::new_v4().to_string();
+    let session_token = [session_token_p1.as_str(), "_", session_token_p2.as_str()].concat();
+    let headers = axum::response::AppendHeaders([(
+        axum::http::header::SET_COOKIE,
+        "session_token=".to_owned()
+            + &*session_token
+            + "; path=/; httponly; secure; samesite=strict",
+    )]);
+    let now = Utc::now().timestamp();
+
+    sqlx::query(
+        "INSERT INTO user_sessions
+        (session_token_p1, session_token_p2, user_id, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?);",
+    )
+    .bind(session_token_p1)
+    .bind(session_token_p2)
+    .bind(user_id)
+    .bind(now)
+    .bind(now + 60 * 60 * 24)
+    .execute(&db_pool)
+    .await?;
+
+    Ok((headers, Redirect::to(return_url.as_str())))
+}
+
+pub async fn oauth_return_(
     Query(mut params): Query<HashMap<String, String>>,
     State(db_pool): State<SqlitePool>,
     Host(hostname): Host,
@@ -126,7 +340,7 @@ pub async fn oauth_return(
     let pkce_code_verifier = PkceCodeVerifier::new(pkce_code_verifier);
 
     // Exchange the code with a token.
-    let client = get_client(hostname)?;
+    let client = get_client_(hostname)?;
     let token_response = tokio::task::spawn_blocking(move || {
         client
             .exchange_code(code)

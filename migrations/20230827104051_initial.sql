@@ -13,7 +13,7 @@ CREATE TABLE "user_sessions" (
 CREATE TABLE "oauth2_state_storage" (
     "id" integer NOT NULL PRIMARY KEY AUTOINCREMENT,
     "csrf_state" text NOT NULL,
-    "pkce_code_verifier" text NOT NULL,
+    "nonce" text NOT NULL,
     "return_url" text NOT NULL
 );
 PRAGMA journal_mode=WAL;
