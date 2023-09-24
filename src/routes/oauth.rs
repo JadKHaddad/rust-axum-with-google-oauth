@@ -148,7 +148,12 @@ pub async fn login(
         .add_claims_locale(LanguageTag::new("groups".to_string()))
         .url();
 
-    println!("insert");
+    println!(
+        "insert: csrf_state: {}, nonce: {}, return_url: {}",
+        csrf_state.secret(),
+        nonce.secret(),
+        return_url
+    );
     sqlx::query(
         "INSERT INTO oauth2_state_storage (csrf_state, nonce, return_url) VALUES (?, ?, ?);",
     )
@@ -209,29 +214,29 @@ pub async fn oauth_return(
     let state = CsrfToken::new(params.remove("state").ok_or("OAuth: without state")?);
     let code = AuthorizationCode::new(params.remove("code").ok_or("OAuth: without code")?);
 
-    println!("delete");
-    let query: (String, String) = sqlx::query_as(
-        r#"DELETE FROM oauth2_state_storage WHERE csrf_state = ? RETURNING nonce,return_url"#,
-    )
-    .bind(state.secret())
-    .fetch_one(&db_pool)
-    .await?;
-    println!("deleted");
-
-    let nonce = query.0;
-    let return_url = query.1;
-
-    // Alternative:
+    // println!("delete: {}", state.secret());
     // let query: (String, String) = sqlx::query_as(
-    //     r#"SELECT pkce_code_verifier,return_url FROM oauth2_state_storage WHERE csrf_state = ?"#,
+    //     r#"DELETE FROM oauth2_state_storage WHERE csrf_state = ? RETURNING nonce,return_url"#,
     // )
     // .bind(state.secret())
     // .fetch_one(&db_pool)
     // .await?;
-    // let _ = sqlx::query("DELETE FROM oauth2_state_storage WHERE csrf_state = ?")
-    //     .bind(state.secret())
-    //     .execute(&db_pool)
-    //     .await;
+    // println!("deleted");
+
+    // Alternative:
+    let query: (String, String) =
+        sqlx::query_as(r#"SELECT nonce,return_url FROM oauth2_state_storage WHERE csrf_state = ?"#)
+            .bind(state.secret())
+            .fetch_one(&db_pool)
+            .await?;
+    let _ = sqlx::query("DELETE FROM oauth2_state_storage WHERE csrf_state = ?")
+        .bind(state.secret())
+        .execute(&db_pool)
+        .await;
+
+    let nonce = query.0;
+    let return_url = query.1;
+    println!("returned: nonce: {}, return_url: {}", nonce, return_url);
 
     let client = get_client().await?;
     // Exchange the code with a token.
@@ -255,14 +260,17 @@ pub async fn oauth_return(
     let userinfo_claims: UserInfoClaims<Claims, CoreGenderClaim> = client
         .user_info(access_token, None)
         .map_err(|_| "OAuth: No user info endpoint")?
-        .request(http_client)
+        .request_async(async_http_client)
+        .await
         .map_err(|_| "OAuth: Failed requesting user info")?;
+    println!("Provider returned UserInfo: {:?}", userinfo_claims);
 
     let email = userinfo_claims
         .email()
         .to_owned()
         .map(|s| s.to_string())
         .ok_or("Auth: No email")?;
+    println!("email: {}", email);
 
     // Check if user exists in database
     // If not, create a new user
@@ -286,9 +294,7 @@ pub async fn oauth_return(
     let session_token = [session_token_p1.as_str(), "_", session_token_p2.as_str()].concat();
     let headers = axum::response::AppendHeaders([(
         axum::http::header::SET_COOKIE,
-        "session_token=".to_owned()
-            + &*session_token
-            + "; path=/; httponly; secure; samesite=strict",
+        "session_token=".to_owned() + &*session_token + "; path=/; httponly;  samesite=strict",
     )]);
     let now = Utc::now().timestamp();
 
